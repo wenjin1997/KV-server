@@ -13,6 +13,9 @@
   - [处理 Iterator](#处理-iterator)
   - [支持事件通知](#支持事件通知)
   - [定义协议的Frame](#定义协议的frame)
+  - [网络安全](#网络安全)
+    - [生成x509证书](#生成x509证书)
+    - [使用TLS](#使用tls)
 
 # KV-server
 ## 需求
@@ -541,3 +544,24 @@ pub struct ProstClientStream<S> {
 这里 S 是泛型参数，未来方便支持 WebSocket，或者在 TCP 之上支持 TLS。后面再为服务器实现 process()， 为客户端实现 execute() 方法。
 
 客户端的使用见[src/bin/client.rs](kv/src/bin/client.rs)，服务端使用见[src/bin/server.rs](kv/src/bin/server.rs)。
+
+## 网络安全
+使用TLS保证网络的安全性。
+
+### 生成x509证书
+TLS需要x509证书让客户端验证服务器是否是一个受信的服务器，甚至服务器验证客户端，确认对方是一个受信的客户端。
+
+使用[certify](https://github.com/tyrchen/certify)库来生成各种证书。
+
+在根目录下创建 fixtures 目录用来存放证书，创建[examples/gen_cert.rs](kv/examples/gen_cert.rs)，先生成一个 CA 证书，然后再生成服务器和客户端证书，全部存入 fixtures 目录下。
+
+### 使用TLS
+TLS构建于TCP之上，对于 KV server，使用 TLS 之后，整个协议的数据封装如下图所示：
+
+![data](img/data.png)
+
+使用[tokio-rustls](https://github.com/tokio-rs/tls/tree/master/tokio-rustls)来支持 TLS。
+
+创建[src/network/tls.rs](kv/src/network/tls.rs)文件，创建两个数据结构 `TlsServerAcceptor` 和 `TlsClientConnector`，根据提供的证书，来生成 tokio-tls 需要的 ServerConfig 和 ClientConfig。
+
+再修改[src/bin/server.rs](kv/src/bin/server.rs)与[src/bin/client.rs](kv/src/bin/client.rs)让它们支持TLS。

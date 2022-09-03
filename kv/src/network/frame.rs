@@ -61,6 +61,7 @@ where
             Ok(())
         }
     }
+
     /// 把一个完整的 frame decode 成一个 Message
     fn decode_frame(buf: &mut BytesMut) -> Result<Self, KvError> {
         // 先取 4 字节，从中拿出长度和 compression bit
