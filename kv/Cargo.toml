@@ -12,6 +12,8 @@ http = "0.2" # 我们使用 HTTP status code 所以引入这个类型库
 prost = "0.9" # 处理 protobuf 的代码
 thiserror = "1" # 错误定义和处理
 tracing = "0.1" # 日志处理
+sled = "0.34" # sled db
+tempfile = "3.3.0" # 处理临时目录和临时文件
 
 [dev-dependencies]
 anyhow = "1" # 错误处理
