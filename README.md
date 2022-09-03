@@ -12,6 +12,7 @@
   - [Server](#server)
   - [处理 Iterator](#处理-iterator)
   - [支持事件通知](#支持事件通知)
+  - [定义协议的Frame](#定义协议的frame)
 
 # KV-server
 ## 需求
@@ -444,3 +445,99 @@ impl<Store: Storage> Service<Store> {
     }
 }
 ```
+
+## 定义协议的Frame
+要区分不同的消息可以用\r\n这种进行分隔符，也可以用长度进行分隔。由于KV server使用的是protobuf来定义协议，承载的是二进制，因此在 payload 之前放一个长度，来作为 frame 的分隔。
+
+使用 tokio-util 中的 [LengthDelimitedCodec](https://docs.rs/tokio-util/latest/tokio_util/codec/length_delimited/index.html)。见[examples/server_with_codec.rs](/kv/examples/server_with_codec.rs)。
+
+用下面的命令运行：
+```bash
+RUST_LOG=info cargo run --example server_with_codec --quiet
+RUST_LOG=info cargo run --example client --quiet
+```
+
+自己处理Frame，可以设置长度为4个字节，这样payload可以到4G。考虑到压缩，把4字节长度的最高位拿出来作为是否压缩的信号。
+
+![frame](img/frame.png)
+
+定义 FrameCoder trait。见[src/network/frame.rs](/kv/src/network/frame.rs)。
+
+```rust
+pub trait FrameCoder
+where
+    Self: Message + Sized + Default,
+{
+    /// 把一个 Message encode 成一个 frame
+    fn encode_frame(&self, buf: &mut BytesMut) -> Result<(), KvError>;
+    /// 把一个完整的 frame decode 成一个 Message
+    fn decode_frame(buf: &mut BytesMut) -> Result<Self, KvError>;
+}
+```
+* encode_frame() 可以把诸如 CommandRequest 这样的消息封装成一个 frame，写入传进来的 BytesMut；
+* decode_frame() 可以把收到的一个完整的、放在 BytesMut 中的数据，解封装成诸如 CommandRequest 这样的消息。
+
+如果要实现这个 trait，Self 需要实现了 prost::Message，大小是固定的，并且实现了 Default（prost 的需求）。
+
+使用[flate2](https://github.com/rust-lang/flate2-rs)库处理gzip压缩。具体实现代码见[src/network/frame.rs](kv/src/network/frame.rs)。
+
+这里设置COMPRESS_LIMIT位1436。因为以太网的 MTU 是 1500，除去 IP 头 20 字节、TCP 头 20 字节，还剩 1460；一般 TCP 包会包含一些 Option（比如 timestamp），IP 包也可能包含，所以我们预留 20 字节；再减去 4 字节的长度，就是 1436，不用分片的最大消息长度。如果大于这个，很可能会导致分片，我们就干脆压缩一下。
+
+decode_frame() 函数使用BytesMut，还需要处理从 socket 中拿出来。先读4个字节，取出长度 N，然后再读 N 个字节。因此写个辅助函数 read_frame()。
+
+```rust
+/// 从 stream 中读取一个完整的 frame
+pub async fn read_frame<S>(stream: &mut S, buf: &mut BytesMut) -> Result<(), KvError>
+where
+    S: AsyncRead + Unpin + Send,
+{
+    let header = stream.read_u32().await? as usize;
+    let (len, _compressed) = decode_header(header);
+    // 如果没有这么大的内存，就分配至少一个 frame 的内存，保证它可用
+    buf.reserve(LEN_LEN + len);
+    buf.put_u32(header as _);
+    // advance_mut 是 unsafe 的原因是，从当前位置 pos 到 pos + len，
+    // 这段内存目前没有初始化。我们就是为了 reserve 这段内存，然后从 stream
+    // 里读取，读取完，它就是初始化的。所以，我们这么用是安全的
+    unsafe { buf.advance_mut(len) };
+    stream.read_exact(&mut buf[LEN_LEN..]).await?;
+    Ok(())
+}
+```
+要求泛型S满足 AsyncRead trait，是 tokio 下的一个 trait，用于异步读取。
+
+```rust
+pub trait AsyncRead {
+    fn poll_read(
+        self: Pin<&mut Self>, 
+        cx: &mut Context<'_>, 
+        buf: &mut ReadBuf<'_>
+    ) -> Poll<Result<()>>;
+}
+```
+
+一旦某个数据结构实现了 AsyncRead，它就可以使用 AsyncReadExt 提供的多达 29 个辅助方法。这是因为任何实现了 AsyncRead 的数据结构，都自动实现了 AsyncReadExt：
+
+```rust
+impl<R: AsyncRead + ?Sized> AsyncReadExt for R {}
+```
+
+对于 Socket 来说，读取 socket 就是一个不断 poll_read() 的过程，直到读到了满足 ReadBuf 需要的内容。
+
+为了让客户端和服务端更方便地对流进行处理，在网络层再进行一层封装，方便后续支持更多的功能。见[src/network/mod.rs](/kv/src/network/mod.rs)。
+
+```rust
+/// 处理服务器端的某个 accept 下来的 socket 的读写
+pub struct ProstServerStream<S> {
+    inner: S,
+    service: Service,
+}
+
+/// 处理客户端 socket 的读写
+pub struct ProstClientStream<S> {
+    inner: S,
+}
+```
+这里 S 是泛型参数，未来方便支持 WebSocket，或者在 TCP 之上支持 TLS。后面再为服务器实现 process()， 为客户端实现 execute() 方法。
+
+客户端的使用见[src/bin/client.rs](kv/src/bin/client.rs)，服务端使用见[src/bin/server.rs](kv/src/bin/server.rs)。
