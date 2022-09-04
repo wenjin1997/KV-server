@@ -16,6 +16,7 @@
   - [网络安全](#网络安全)
     - [生成x509证书](#生成x509证书)
     - [使用TLS](#使用tls)
+  - [异步处理](#异步处理)
 
 # KV-server
 ## 需求
@@ -565,3 +566,107 @@ TLS构建于TCP之上，对于 KV server，使用 TLS 之后，整个协议的�
 创建[src/network/tls.rs](kv/src/network/tls.rs)文件，创建两个数据结构 `TlsServerAcceptor` 和 `TlsClientConnector`，根据提供的证书，来生成 tokio-tls 需要的 ServerConfig 和 ClientConfig。
 
 再修改[src/bin/server.rs](kv/src/bin/server.rs)与[src/bin/client.rs](kv/src/bin/client.rs)让它们支持TLS。
+
+## 异步处理
+从收包处理到处理完后发包的完整流程和系统结构如下图所示：
+
+![async](img/async.png)
+
+对比[src/service/mod.rs](kv/src/service/mod.rs)中的ProstServerStream 的 process() 与 async_prost 库中 AsyncProst 的调用逻辑：
+
+```rust
+// process() 函数的内在逻辑
+while let Ok(cmd) = self.recv().await {
+    info!("Got a new command: {:?}", cmd);
+    let res = self.service.execute(cmd);
+    self.send(res).await?;
+}
+
+// async_prost 库的 AsyncProst 的调用逻辑
+while let Some(Ok(cmd)) = stream.next().await {
+    info!("Got a new command: {:?}", cmd);
+    let res = svc.execute(cmd);
+    stream.send(res).await.unwrap();
+}
+```
+
+AsyncProst 实现了 Stream 和 Sink trait，因此可以自然地调用 StreamExt trait 的 next() 方法和 SinkExt trait 的 send() 方法，来处理数据的收发，而 ProstServerStream 则自己额外实现了函数 recv() 和 send()。
+
+下面为了未来的可扩展性，和整个异步生态更加融洽，构造一个 ProstStream，实现 Stream 和 Sink 这两个 trait，然后让 ProstServerStream 和 ProstClientStream 使用它。
+
+Stream trait 和 Sink trait 的定义：
+
+```rust
+// 可以类比 Iterator
+pub trait Stream {
+    // 从 Stream 中读取到的数据类型
+    type Item;
+
+    // 从 stream 里读取下一个数据
+    fn poll_next(
+    self: Pin<&mut Self>, cx: &mut Context<'_>
+    ) -> Poll<Option<Self::Item>>;
+}
+
+// 
+pub trait Sink<Item> {
+    type Error;
+    fn poll_ready(
+        self: Pin<&mut Self>, 
+        cx: &mut Context<'_>
+    ) -> Poll<Result<(), Self::Error>>;
+    fn start_send(self: Pin<&mut Self>, item: Item) -> Result<(), Self::Error>;
+    fn poll_flush(
+        self: Pin<&mut Self>, 
+        cx: &mut Context<'_>
+    ) -> Poll<Result<(), Self::Error>>;
+    fn poll_close(
+        self: Pin<&mut Self>, 
+        cx: &mut Context<'_>
+    ) -> Poll<Result<(), Self::Error>>;
+}
+```
+
+ProstStream 的具体实现见[src/network/stream.rs](kv/src/network/stream.rs)。先定义 ProstStream 结构，接着其实现 Stream 和 Sink trait。
+
+```rust
+/// 处理 KV server prost frame 的 stream
+pub struct ProstStream<S, In, Out> where {
+    // innner stream
+    stream: S,
+    // 写缓存
+    wbuf: BytesMut,
+    // 读缓存
+    rbuf: BytesMut,
+
+    // 类型占位符
+    _in: PhantomData<In>,
+    _out: PhantomData<Out>,
+}
+```
+
+实现 ProstStream 后就可以修改 ProstServerStream 和 ProstClientStream 结构，具体代码见[src/network/mod.rs](/kv/src/network/mod.rs)。
+
+```rust
+/// 处理服务器端的某个 accept 下来的 socket 的读写
+// // 旧的接口
+// pub struct ProstServerStream<S> {
+//     inner: S,
+//     service: Service,
+// }
+pub struct ProstServerStream<S> {
+    inner: ProstStream<S, CommandRequest, CommandResponse>,
+    service: Service,
+}
+
+/// 处理客户端 socket 的读写
+// // 旧的接口
+// pub struct ProstClientStream<S> {
+//     inner: S,
+// }
+pub struct ProstClientStream<S> {
+    inner: ProstStream<S, CommandResponse, CommandRequest>,
+}
+```
+
+最后在修改它们的一些实现方法。
